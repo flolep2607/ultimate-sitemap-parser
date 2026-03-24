@@ -3,6 +3,7 @@
 import abc
 import random
 import time
+from collections.abc import Iterator
 from http import HTTPStatus
 
 RETRYABLE_HTTP_STATUS_CODES = {
@@ -97,6 +98,16 @@ class AbstractWebClientSuccessResponse(
         Return encoded raw data of the response.
 
         :return: Encoded raw data of the response.
+        """
+        raise NotImplementedError("Abstract method.")
+
+    @abc.abstractmethod
+    def iter_content(self, chunk_size: int = 65536) -> Iterator[bytes]:
+        """
+        Return an iterator that yields the response body in chunks.
+
+        :param chunk_size: Number of bytes per chunk.
+        :return: Iterator of byte chunks.
         """
         raise NotImplementedError("Abstract method.")
 
@@ -215,6 +226,11 @@ class LocalWebClientSuccessResponse(AbstractWebClientSuccessResponse):
 
     def raw_data(self) -> bytes:
         return self._data.encode("utf-8")
+
+    def iter_content(self, chunk_size: int = 65536) -> Iterator[bytes]:
+        data = self.raw_data()
+        for i in range(0, max(len(data), 1), chunk_size):
+            yield data[i:i + chunk_size]
 
     def url(self) -> str:
         return self._url
