@@ -1,6 +1,7 @@
 """Implementation of :mod:`usp.web_client.abstract_client` with Requests."""
 
 import logging
+from collections.abc import Iterator
 from http import HTTPStatus
 
 import requests
@@ -60,6 +61,9 @@ class RequestsWebClientSuccessResponse(AbstractWebClientSuccessResponse):
             data = self.__requests_response.content
 
         return data
+
+    def iter_content(self, chunk_size: int = 65536) -> Iterator[bytes]:
+        return self.__requests_response.iter_content(chunk_size=chunk_size)
 
     def url(self) -> str:
         return self.__requests_response.url

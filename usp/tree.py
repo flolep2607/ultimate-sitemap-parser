@@ -1,6 +1,8 @@
 """Helpers to generate a sitemap tree."""
 
 import logging
+from collections import deque
+from collections.abc import Iterator
 
 from .exceptions import SitemapException
 from .fetch_parse import SitemapFetcher, SitemapStrParser
@@ -10,6 +12,7 @@ from .helpers import (
     is_http_url,
     strip_url_to_homepage,
 )
+from .objects.page import SitemapPage
 from .objects.sitemap import (
     AbstractSitemap,
     IndexRobotsTxtSitemap,
@@ -17,6 +20,7 @@ from .objects.sitemap import (
     InvalidSitemap,
 )
 from .web_client.abstract_client import AbstractWebClient
+from .web_client.requests_client import RequestsWebClient
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +132,55 @@ def sitemap_tree_for_homepage(
     index_sitemap = IndexWebsiteSitemap(url=homepage_url, sub_sitemaps=sitemaps)
 
     return index_sitemap
+
+
+def stream_pages(
+    homepage_url: str,
+    web_client: AbstractWebClient | None = None,
+) -> Iterator[SitemapPage]:
+    """
+    Yield all sitemap pages for a website one sub-sitemap at a time.
+
+    Uses a BFS queue so that nested index sitemaps are handled without
+    recursion and without holding more than one parsed sitemap in memory.
+    Already-seen URLs are skipped to avoid cycles.
+
+    :param homepage_url: Homepage URL, e.g. ``"https://www.example.com"``.
+    :param web_client: Custom web client; defaults to :class:`~.RequestsWebClient`.
+    :return: Iterator of :class:`~.SitemapPage` objects.
+    """
+    if web_client is None:
+        web_client = RequestsWebClient()
+
+    seen_urls: set[str] = set()
+    queue: deque[str] = deque()
+
+    def _collect(urls, recursion_level, parent_urls):
+        for url in urls:
+            if url not in seen_urls:
+                seen_urls.add(url)
+                queue.append(url)
+        return []
+
+    # Discover top-level sub-sitemap URLs via robots.txt and known paths
+    sitemap_tree_for_homepage(
+        homepage_url,
+        web_client=web_client,
+        recurse_list_callback=_collect,
+    )
+
+    while queue:
+        url = queue.popleft()
+        sitemap = SitemapFetcher(
+            url=url,
+            web_client=web_client,
+            recursion_level=1,
+            parent_urls=set(),
+            recurse_list_callback=_collect,
+        ).sitemap()
+        if not isinstance(sitemap, InvalidSitemap):
+            yield from sitemap.all_pages()
+        del sitemap
 
 
 def sitemap_from_str(content: str) -> AbstractSitemap:

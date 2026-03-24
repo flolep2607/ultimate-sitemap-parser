@@ -10,9 +10,7 @@
 
 import abc
 import logging
-import os
-import pickle
-import tempfile
+from collections import deque
 from collections.abc import Iterator
 from functools import cache
 
@@ -210,7 +208,7 @@ class AbstractPagesSitemap(AbstractSitemap, metaclass=abc.ABCMeta):
     """Abstract sitemap that contains URLs to pages."""
 
     __slots__ = [
-        "__pages_temp_file_path",
+        "__pages",
     ]
 
     def __init__(self, url: str, pages: list[SitemapPage]):
@@ -221,19 +219,7 @@ class AbstractPagesSitemap(AbstractSitemap, metaclass=abc.ABCMeta):
         :param pages: List of pages found in a sitemap.
         """
         super().__init__(url=url)
-
-        self._dump_pages(pages)
-
-    def _dump_pages(self, pages: list[SitemapPage]):
-        fd, self.__pages_temp_file_path = tempfile.mkstemp()
-        with os.fdopen(fd, "wb") as tmp:
-            pickle.dump(pages, tmp, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def __del__(self):
-        try:
-            os.unlink(self.__pages_temp_file_path)
-        except FileNotFoundError as e:
-            log.warning("Unable to remove temp file", exc_info=e)
+        self.__pages = deque(pages)
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, AbstractPagesSitemap):
@@ -242,31 +228,13 @@ class AbstractPagesSitemap(AbstractSitemap, metaclass=abc.ABCMeta):
         if self.url != other.url:
             return False
 
-        if self.pages != other.pages:
+        if list(self.__pages) != list(other.__pages):
             return False
 
         return True
 
     def __repr__(self):
-        return f"{self.__class__.__name__}(url={self.url}, pages={self.pages})"
-
-    def __getstate__(self) -> tuple[None, dict]:
-        # Load slots of this class and its parents (mangling if appropriate)
-        obj_slots = {slot: getattr(self, slot) for slot in _all_slots(self.__class__)}
-        # Replace temp file path with actual content
-        del obj_slots["_AbstractPagesSitemap__pages_temp_file_path"]
-        obj_slots["_pages_value"] = self.pages
-        return None, obj_slots
-
-    def __setstate__(self, state: tuple):
-        _, attrs = state
-        # We can't restore contents without this key
-        if "_pages_value" not in attrs:
-            raise ValueError("State does not contain pages value")
-        pages_val = attrs.pop("_pages_value")
-        for slot, val in attrs.items():
-            setattr(self, slot, val)
-        self._dump_pages(pages_val)
+        return f"{self.__class__.__name__}(url={self.url}, pages={list(self.__pages)})"
 
     def to_dict(self, with_pages=True) -> dict:
         obj = {
@@ -274,20 +242,17 @@ class AbstractPagesSitemap(AbstractSitemap, metaclass=abc.ABCMeta):
         }
 
         if with_pages:
-            obj["pages"] = [page.to_dict() for page in self.pages]
+            obj["pages"] = [page.to_dict() for page in self.all_pages()]
 
         return obj
 
     @property
     def pages(self) -> list[SitemapPage]:
-        """
-        Load pages from disk swap file and return them.
+        return list(self.__pages)
 
-        :return: List of pages found in the sitemap.
-        """
-        with open(self.__pages_temp_file_path, "rb") as tmp:
-            pages = pickle.load(tmp)
-        return pages
+    def all_pages(self) -> Iterator[SitemapPage]:
+        while self.__pages:
+            yield self.__pages.popleft()
 
     @property
     def sub_sitemaps(self) -> list["AbstractSitemap"]:

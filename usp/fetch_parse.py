@@ -12,7 +12,9 @@ import logging
 import re
 import xml.parsers.expat
 from collections import OrderedDict
+from collections.abc import Iterator
 from decimal import Decimal, InvalidOperation
+from itertools import chain
 
 from .exceptions import SitemapException, SitemapXMLParsingException
 from .helpers import (
@@ -21,6 +23,7 @@ from .helpers import (
     get_url_retry_on_client_errors,
     html_unescape_strip,
     is_http_url,
+    iter_response_content,
     parse_iso8601_date,
     parse_rfc2822_date,
     ungzipped_response_content,
@@ -60,11 +63,6 @@ class SitemapFetcher:
     """
     Fetches and parses the sitemap at a given URL, and any declared sub-sitemaps.
     """
-
-    __MAX_SITEMAP_SIZE = 100 * 1024 * 1024
-    """Max. uncompressed sitemap size.
-
-    Spec says it might be up to 50 MB but let's go for the full 100 MB here."""
 
     __MAX_RECURSION_LEVEL = 11
     """Max. depth level in iterating over sub-sitemaps.
@@ -127,8 +125,6 @@ class SitemapFetcher:
         if not web_client:
             web_client = RequestsWebClient()
 
-        web_client.set_max_response_data_length(self.__MAX_SITEMAP_SIZE)
-
         self._url = url
         self._web_client = web_client
         self._recursion_level = recursion_level
@@ -172,14 +168,26 @@ class SitemapFetcher:
 
         self._url = response_url
 
-        response_content = ungzipped_response_content(url=self._url, response=response)
+        # Stream the response body (decompresses gzip transparently, no full load)
+        byte_stream = iter_response_content(url=self._url, response=response)
+
+        # Peek enough bytes to detect XML vs plain text without loading the whole body
+        peek_buf = b""
+        peek_chunks = []
+        for chunk in byte_stream:
+            peek_chunks.append(chunk)
+            peek_buf += chunk
+            if len(peek_buf) >= 20:
+                break
+        full_stream = chain(peek_chunks, byte_stream)
 
         # MIME types returned in Content-Type are unpredictable, so peek into the content instead
-        if response_content[:20].strip().startswith("<"):
-            # XML sitemap (the specific kind is to be determined later)
+        if peek_buf.lstrip().startswith(b"<"):
+            # XML sitemap (the specific kind is to be determined later) — parse incrementally
             parser = XMLSitemapParser(
                 url=self._url,
-                content=response_content,
+                content="",
+                stream=full_stream,
                 recursion_level=self._recursion_level,
                 web_client=self._web_client,
                 parent_urls=self._parent_urls,
@@ -188,7 +196,10 @@ class SitemapFetcher:
             )
 
         else:
-            # Assume that it's some sort of a text file (robots.txt or plain text sitemap)
+            # robots.txt and plain-text sitemaps are small — load fully for line-splitting
+            remaining = b"".join(full_stream)
+            response_content = remaining.decode("utf-8-sig", errors="replace")
+
             if self._url.endswith("/robots.txt"):
                 parser = IndexRobotsTxtSitemapParser(
                     url=self._url,
@@ -410,6 +421,7 @@ class XMLSitemapParser(AbstractSitemapParser):
     __slots__ = [
         "_concrete_parser",
         "_is_non_ns_sitemap",
+        "_stream",
     ]
 
     def __init__(
@@ -421,6 +433,7 @@ class XMLSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        stream: Iterator[bytes] | None = None,
     ):
         super().__init__(
             url=url,
@@ -436,6 +449,8 @@ class XMLSitemapParser(AbstractSitemapParser):
         self._concrete_parser = None
         # Whether this is a malformed sitemap with no namespace
         self._is_non_ns_sitemap = False
+        # Optional byte stream for incremental parsing (avoids loading full body)
+        self._stream = stream
 
     def sitemap(self) -> AbstractSitemap:
         parser = xml.parsers.expat.ParserCreate(
@@ -446,8 +461,13 @@ class XMLSitemapParser(AbstractSitemapParser):
         parser.CharacterDataHandler = self._xml_char_data
 
         try:
-            is_final = True
-            parser.Parse(self._content, is_final)
+            if self._stream is not None:
+                # Incremental streaming parse — never holds more than one chunk in memory
+                for chunk in self._stream:
+                    parser.Parse(chunk, False)
+                parser.Parse(b"", True)
+            else:
+                parser.Parse(self._content, True)
         except Exception as ex:
             # Some sitemap XML files might end abruptly because webservers might be timing out on returning huge XML
             # files so don't return InvalidSitemap() but try to get as much pages as possible

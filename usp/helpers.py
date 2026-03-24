@@ -7,7 +7,8 @@ import logging
 import re
 import sys
 import time
-from collections.abc import Callable
+import zlib
+from collections.abc import Callable, Iterator
 from http import HTTPStatus
 from typing import TypeAlias
 from urllib.parse import unquote_plus, urlparse, urlunparse
@@ -277,6 +278,67 @@ def ungzipped_response_content(
     assert isinstance(data, str)
 
     return data
+
+
+def iter_gunzip(byte_iter: Iterator[bytes]) -> Iterator[bytes]:
+    """Incrementally decompress a gzip byte stream using zlib."""
+    decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+    for chunk in byte_iter:
+        out = decompressor.decompress(chunk)
+        if out:
+            yield out
+    out = decompressor.flush()
+    if out:
+        yield out
+
+
+def iter_response_content(
+    url: str, response: AbstractWebClientSuccessResponse
+) -> Iterator[bytes]:
+    """Stream HTTP response body, transparently decompressing gzip if needed.
+
+    Yields raw byte chunks; never loads the full body into memory.
+    Falls back to uncompressed if gzip decompression fails on the first chunk
+    (handles .gz URLs that are actually plain XML).
+    """
+    raw_iter = response.iter_content()
+
+    if not __response_is_gzipped_data(url=url, response=response):
+        yield from raw_iter
+        return
+
+    decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+    first = True
+
+    for chunk in raw_iter:
+        if first:
+            first = False
+            try:
+                out = decompressor.decompress(chunk)
+                if out:
+                    yield out
+            except zlib.error as ex:
+                log.warning(
+                    f"Unable to gunzip response for {url}, treating as plain: {ex}"
+                )
+                yield chunk
+                yield from raw_iter
+                return
+        else:
+            try:
+                out = decompressor.decompress(chunk)
+                if out:
+                    yield out
+            except zlib.error as ex:
+                log.error(f"Gunzip error mid-stream for {url}: {ex}")
+                return
+
+    try:
+        out = decompressor.flush()
+        if out:
+            yield out
+    except zlib.error:
+        pass
 
 
 def strip_url_to_homepage(url: str) -> str:
